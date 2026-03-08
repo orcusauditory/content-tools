@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
 # recording-day-prep.sh
-# Runs the night before recording days (Mon/Tue evenings — Sun/Mon at 10pm PT).
-# Checks: scripts ready, equipment reminder, calendar clear, content summary.
-# Posts briefing to #general by 8am (scheduled via cron for 10pm night before).
+# Runs at 7:30am on recording days (Mon + Tue) and posts a readiness briefing
+# to #general before the 8am window.
+#
+# Cron: 30 7 * * 1,2 America/Los_Angeles (job id: 4816f879)
 #
 # Usage: bash recording-day-prep.sh [--dry-run]
-#
-# Cron: openclaw cron add --agent hermes --name "Recording Day Prep"
-#         --schedule "0 22 * * 0,1" --tz "America/Los_Angeles"
-#         --message "Run ~/.openclaw/scripts/recording-day-prep.sh"
 
 set -euo pipefail
 
@@ -18,9 +15,11 @@ DRY_RUN=false
 GENERAL_CHANNEL="1476011153350987889"
 SCRIPTS_DIR="$HOME/content-tools"
 LOG_FILE="$HOME/.openclaw/logs/recording-day-prep.log"
-DATE=$(date +%Y-%m-%d)
-DAY_OF_WEEK=$(date +%u)   # 1=Mon … 7=Sun
-TOMORROW=$(date -v+1d +%A 2>/dev/null || date -d tomorrow +%A 2>/dev/null)
+MC_API="http://localhost:3000/api"
+
+TODAY=$(date +%A)              # Monday / Tuesday / etc.
+TODAY_DATE=$(date +%Y-%m-%d)
+WEEK_END=$(date -v+7d +%Y-%m-%d 2>/dev/null || date -d "+7 days" +%Y-%m-%d)
 
 mkdir -p "$(dirname "$LOG_FILE")"
 
@@ -28,147 +27,161 @@ log() {
   echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] [recording-prep] $1" | tee -a "$LOG_FILE"
 }
 
-log "Starting recording day prep check (dry_run=$DRY_RUN, tomorrow=$TOMORROW)"
+log "Starting recording day prep (dry_run=$DRY_RUN, today=$TODAY/$TODAY_DATE)"
 
-# ── 1. Detect recording day ────────────────────────────────────────────────────
-# Recording days: Monday and Tuesday
-# This script fires Sun night (before Mon) and Mon night (before Tue)
-case "$TOMORROW" in
-  Monday|Tuesday) RECORDING_DAY=true ;;
-  *)              RECORDING_DAY=false ;;
+# ── 1. Verify this is actually a recording day ─────────────────────────────────
+case "$TODAY" in
+  Monday|Tuesday) : ;;
+  *)
+    log "Today ($TODAY) is not a recording day — exiting."
+    exit 0
+    ;;
 esac
 
-if [[ "$RECORDING_DAY" == "false" ]]; then
-  log "Tomorrow ($TOMORROW) is not a recording day — exiting."
-  exit 0
-fi
-
-log "Tomorrow is a recording day ($TOMORROW) — running prep checks."
-
-# ── 2. Check: scripts directory exists ────────────────────────────────────────
-SCRIPTS_STATUS="✅ content-tools repo found"
-SCRIPTS_DETAIL=""
-
+# ── 2. Tool checks ────────────────────────────────────────────────────────────
+SCRIPTS_STATUS="✅ content-tools ready"
 if [[ ! -d "$SCRIPTS_DIR" ]]; then
-  SCRIPTS_STATUS="⚠️ content-tools repo not found at $SCRIPTS_DIR"
-  SCRIPTS_DETAIL=" (run: git clone https://github.com/orcusauditory/content-tools ~/content-tools)"
-else
-  SCRIPT_COUNT=$(find "$SCRIPTS_DIR" -name "*.py" -o -name "*.sh" 2>/dev/null | wc -l | tr -d ' ')
-  SCRIPTS_STATUS="✅ content-tools ready ($SCRIPT_COUNT scripts)"
+  SCRIPTS_STATUS="⚠️ ~/content-tools not found (git clone https://github.com/orcusauditory/content-tools)"
+elif [[ ! -f "$SCRIPTS_DIR/social-clip/social-clip.py" ]]; then
+  SCRIPTS_STATUS="⚠️ social-clip missing — run: git -C ~/content-tools pull"
 fi
 
-# ── 3. Check: social-clip pipeline available ──────────────────────────────────
-if [[ -f "$SCRIPTS_DIR/social-clip/social-clip.py" ]]; then
-  CLIP_STATUS="✅ social-clip pipeline ready"
-else
-  CLIP_STATUS="⚠️ social-clip pipeline missing — run: git -C ~/content-tools pull"
-fi
-
-# ── 4. Check: ffmpeg available ────────────────────────────────────────────────
-if command -v ffmpeg &>/dev/null; then
-  FFMPEG_VER=$(ffmpeg -version 2>&1 | head -1 | awk '{print $3}')
-  FFMPEG_STATUS="✅ ffmpeg $FFMPEG_VER"
-else
+FFMPEG_STATUS="✅ ffmpeg ready"
+if ! command -v ffmpeg &>/dev/null; then
   FFMPEG_STATUS="❌ ffmpeg not found — brew install ffmpeg"
 fi
 
-# ── 5. Check: calendar events tomorrow via gog ───────────────────────────────
-CALENDAR_STATUS="📅 Calendar: check not available"
-CALENDAR_CONFLICTS=""
+# ── 3. Calendar: conflicts today ──────────────────────────────────────────────
+CALENDAR_STATUS="📅 Calendar unavailable"
+CONFLICT_DETAIL=""
 
-if command -v openclaw &>/dev/null; then
-  TOMORROW_DATE=$(date -v+1d +%Y-%m-%d 2>/dev/null || date -d tomorrow +%Y-%m-%d 2>/dev/null)
-  CAL_RAW=$(openclaw gog calendar list --date "$TOMORROW_DATE" --json 2>/dev/null || echo "[]")
-  EVENT_COUNT=$(echo "$CAL_RAW" | python3 -c "
+CAL_JSON=$(curl -sf "$MC_API/calendar" 2>/dev/null || echo "[]")
+if [[ "$CAL_JSON" != "[]" && -n "$CAL_JSON" ]]; then
+  CONFLICT_RESULT=$(echo "$CAL_JSON" | python3 -c "
 import sys, json
-try:
-    events = json.load(sys.stdin)
-    events = events if isinstance(events, list) else events.get('events', events.get('items', []))
-    print(len(events))
-except:
-    print('?')
-" 2>/dev/null || echo "?")
+from datetime import date, datetime
 
-  if [[ "$EVENT_COUNT" == "0" ]]; then
-    CALENDAR_STATUS="✅ Calendar clear tomorrow"
-  elif [[ "$EVENT_COUNT" == "?" ]]; then
-    CALENDAR_STATUS="📅 Calendar: could not fetch"
+today_str = '$(date +%Y-%m-%d)'
+events = json.load(sys.stdin)
+if not isinstance(events, list):
+    events = events.get('events', events.get('items', []))
+
+conflicts = []
+for e in events:
+    start = e.get('start', '')
+    if isinstance(start, dict):
+        start = start.get('dateTime', start.get('date', ''))
+    if start.startswith(today_str):
+        summary = e.get('summary', '?')
+        t = start[11:16] if 'T' in start else 'all day'
+        conflicts.append(f'{t} — {summary}')
+
+print(len(conflicts))
+for c in conflicts:
+    print(c)
+" 2>/dev/null || echo "0")
+
+  CONFLICT_COUNT=$(echo "$CONFLICT_RESULT" | head -1)
+  if [[ "$CONFLICT_COUNT" == "0" ]]; then
+    CALENDAR_STATUS="✅ Calendar clear today"
   else
-    CALENDAR_STATUS="⚠️ $EVENT_COUNT event(s) tomorrow — check for conflicts"
-    CALENDAR_CONFLICTS=$(echo "$CAL_RAW" | python3 -c "
-import sys, json
-try:
-    events = json.load(sys.stdin)
-    events = events if isinstance(events, list) else events.get('events', events.get('items', []))
-    for e in events[:3]:
-        title = e.get('summary', e.get('title', '?'))
-        start = e.get('start', {})
-        t = start.get('dateTime', start.get('date', ''))[:16].replace('T',' ')
-        print(f'  • {t} — {title}')
-except:
-    pass
-" 2>/dev/null || true)
+    CALENDAR_STATUS="⚠️ $CONFLICT_COUNT event(s) today — check for recording conflicts"
+    CONFLICT_DETAIL=$(echo "$CONFLICT_RESULT" | tail -n +2 | sed 's/^/  • /')
   fi
 fi
 
-# ── 6. Equipment reminder ─────────────────────────────────────────────────────
-EQUIPMENT_CHECKLIST=$(cat <<'CHECKLIST'
+# ── 4. Content calendar: check for recording/content items this week ──────────
+CONTENT_STATUS="📋 Content calendar: no upcoming items found"
+CONTENT_DETAIL=""
+
+if [[ "$CAL_JSON" != "[]" && -n "$CAL_JSON" ]]; then
+  CONTENT_RESULT=$(echo "$CAL_JSON" | python3 -c "
+import sys, json, re
+from datetime import date
+
+today_str = '$(date +%Y-%m-%d)'
+week_end_str = '$WEEK_END'
+today = date.fromisoformat(today_str)
+week_end = date.fromisoformat(week_end_str)
+
+KEYWORDS = r'record|episode|content|audio|publish|release|edit|podcast|narrat|script|studio'
+
+events = json.load(sys.stdin)
+if not isinstance(events, list):
+    events = events.get('events', events.get('items', []))
+
+content_items = []
+for e in events:
+    summary = e.get('summary', '')
+    desc = e.get('description', '')
+    text = (summary + ' ' + desc).lower()
+    if re.search(KEYWORDS, text, re.I):
+        start = e.get('start', '')
+        if isinstance(start, dict):
+            start = start.get('dateTime', start.get('date', ''))
+        date_part = start[:10]
+        try:
+            ev_date = date.fromisoformat(date_part)
+            if today <= ev_date <= week_end:
+                t = start[11:16] if 'T' in start else ''
+                label = f'{date_part} {t}'.strip()
+                content_items.append(f'{label} — {summary}')
+        except:
+            pass
+
+print(len(content_items))
+for c in content_items:
+    print(c)
+" 2>/dev/null || echo "0")
+
+  CONTENT_COUNT=$(echo "$CONTENT_RESULT" | head -1)
+  if [[ "$CONTENT_COUNT" == "0" ]]; then
+    CONTENT_STATUS="⚠️ No recording/content events found in calendar this week — consider adding to Google Calendar"
+  else
+    CONTENT_STATUS="✅ $CONTENT_COUNT content item(s) on calendar this week"
+    CONTENT_DETAIL=$(echo "$CONTENT_RESULT" | tail -n +2 | sed 's/^/  • /')
+  fi
+fi
+
+# ── 5. Equipment checklist ────────────────────────────────────────────────────
+EQUIPMENT=$(cat <<'EQ'
   🎙️ Mic plugged in + gain set
   🎧 Headphones charged
   💻 DAW open (GarageBand / Logic)
   📁 Session folder created for today
   🔇 Phone on Do Not Disturb
   🚪 Recording space quiet / door sign up
-CHECKLIST
+EQ
 )
 
-# ── 7. Content calendar status ────────────────────────────────────────────────
-CONTENT_STATUS="📋 Content calendar: manual check needed"
+# ── 6. Build message ──────────────────────────────────────────────────────────
+BODY="🎙️ **Recording Day — $TODAY ($TODAY_DATE)**
 
-# Check if there's a local content calendar file
-for loc in \
-  "$HOME/.openclaw-data/workspace/ref/CONTENT-CALENDAR.md" \
-  "$HOME/content-tools/CONTENT-CALENDAR.md" \
-  "$HOME/Dropbox/content-calendar.md"; do
-  if [[ -f "$loc" ]]; then
-    LINE_COUNT=$(wc -l < "$loc")
-    CONTENT_STATUS="✅ Content calendar found ($loc, $LINE_COUNT lines)"
-    break
-  fi
-done
-
-# ── 8. Build message ──────────────────────────────────────────────────────────
-MSG="🎙️ **Recording Day Prep — $TOMORROW**
-
-**Readiness Check:**
+**Readiness:**
 $SCRIPTS_STATUS
-$CLIP_STATUS
 $FFMPEG_STATUS
-$CALENDAR_STATUS$([ -n "$CALENDAR_CONFLICTS" ] && echo -e "\n$CALENDAR_CONFLICTS" || true)
-$CONTENT_STATUS
+$CALENDAR_STATUS$([ -n "$CONFLICT_DETAIL" ] && printf '\n%s' "$CONFLICT_DETAIL" || true)
+$CONTENT_STATUS$([ -n "$CONTENT_DETAIL" ] && printf '\n%s' "$CONTENT_DETAIL" || true)
 
-**Equipment Checklist:**
-$EQUIPMENT_CHECKLIST
+**Equipment:**
+$EQUIPMENT
 
-**Quick commands:**
 \`\`\`bash
-# Generate social clip from today's recording:
-python3 ~/content-tools/social-clip/social-clip.py recording.mp3 \\
-  --caption \"Your Title\" --subtitle \"Out Now\"
+python3 ~/content-tools/social-clip/social-clip.py <recording.mp3> \\
+  --caption \"Title\" --subtitle \"Out Now\"
 \`\`\`
+_$(date -u +%Y-%m-%dT%H:%M)Z_"
 
-_Automated prep check — $(date -u +%Y-%m-%dT%H:%M)Z_"
+log "Message built (${#BODY} chars)"
 
-log "Message prepared (${#MSG} chars)"
-
-# ── 9. Send or dry-run ────────────────────────────────────────────────────────
+# ── 7. Send or dry-run ────────────────────────────────────────────────────────
 if [[ "$DRY_RUN" == "true" ]]; then
-  log "DRY RUN — message not sent:"
-  echo "$MSG"
+  log "DRY RUN — would post to #general:"
+  echo "$BODY"
 else
-  log "Sending to #general ($GENERAL_CHANNEL)..."
-  openclaw message send --channel "$GENERAL_CHANNEL" --message "$MSG"
-  log "Sent successfully."
+  log "Posting to #general ($GENERAL_CHANNEL)..."
+  openclaw message send --channel "$GENERAL_CHANNEL" --message "$BODY"
+  log "Posted."
 fi
 
-log "Recording day prep complete."
+log "Done."
